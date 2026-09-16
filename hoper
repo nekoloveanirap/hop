@@ -1,0 +1,679 @@
+local Players          = game:GetService("Players")
+local HttpService       = game:GetService("HttpService")
+local TeleportService   = game:GetService("TeleportService")
+local RunService        = game:GetService("RunService")
+local TweenService      = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local PLACE_ID = game.PlaceId
+
+local SERVERS_PER_PAGE = 100
+local PAGES_TO_SCAN    = 6
+local TOP_N            = 20
+
+-- Hosts tentados em ordem. O segundo é um proxy publico que costuma
+-- resolver bloqueios/erros de CORS ao chamar a API da Roblox direto
+-- de dentro de um executor.
+local API_HOSTS = { "games.roblox.com", "games.roproxy.com" }
+
+-- =====================================================================
+-- Tema neutro (cinza/prata) — a única cor que varia é o ping (ms)
+-- =====================================================================
+local BG           = Color3.fromRGB(24, 24, 26)
+local BG_GRAD_TOP  = Color3.fromRGB(30, 30, 33)
+local BG_GRAD_BOT  = Color3.fromRGB(18, 18, 20)
+local BG_TITLEBAR  = Color3.fromRGB(16, 16, 18)
+local BG_CARD      = Color3.fromRGB(28, 28, 31)
+local BG_ROW       = Color3.fromRGB(34, 34, 37)
+local BG_ROW_ALT   = Color3.fromRGB(39, 39, 43)
+local BG_ROW_HOVER = Color3.fromRGB(48, 48, 53)
+local ACCENT       = Color3.fromRGB(180, 180, 186)
+local ACCENT_DIM   = Color3.fromRGB(130, 130, 136)
+local STROKE       = Color3.fromRGB(95, 95, 102)
+local TEXT         = Color3.fromRGB(232, 232, 236)
+local TEXT_DIM     = Color3.fromRGB(146, 146, 152)
+local GREEN        = Color3.fromRGB(110, 220, 140)
+local RED          = Color3.fromRGB(230, 92, 92)
+
+local SHADOW_IMAGE = "rbxassetid://6015897843"
+local SHADOW_SLICE = Rect.new(49, 49, 450, 450)
+
+-- =====================================================================
+-- HTTP helper
+-- =====================================================================
+local REQUEST_HEADERS = {
+    ["User-Agent"] = "Roblox/WinInet",
+    ["Accept"] = "application/json",
+}
+
+local function tryRequesters(url)
+    local attempts = {}
+
+    if syn and syn.request then
+        table.insert(attempts, {"syn.request", function()
+            local res = syn.request({ Url = url, Method = "GET", Headers = REQUEST_HEADERS })
+            return res.StatusCode, res.Body
+        end})
+    end
+    if http and http.request then
+        table.insert(attempts, {"http.request", function()
+            local res = http.request({ Url = url, Method = "GET", Headers = REQUEST_HEADERS })
+            return res.StatusCode, res.Body
+        end})
+    end
+    if request then
+        table.insert(attempts, {"request", function()
+            local res = request({ Url = url, Method = "GET", Headers = REQUEST_HEADERS })
+            return res.StatusCode, res.Body
+        end})
+    end
+    table.insert(attempts, {"game:HttpGet", function()
+        local body = game:HttpGet(url)
+        return 200, body
+    end})
+
+    return attempts
+end
+
+local function httpGet(url)
+    local attempts = tryRequesters(url)
+    local lastErr = "nenhuma funcao de HTTP disponivel neste executor"
+
+    for _, attempt in ipairs(attempts) do
+        local name, fn = attempt[1], attempt[2]
+        local ok, status, body = pcall(fn)
+        if ok and body and body ~= "" then
+            return body
+        end
+        if ok then
+            lastErr = string.format("[%s] status=%s corpo vazio", name, tostring(status))
+        else
+            lastErr = string.format("[%s] erro: %s", name, tostring(status))
+        end
+        print("[ServerFinder] " .. lastErr)
+    end
+    return nil, lastErr
+end
+
+-- Busca servidores tentando cada host da lista até um funcionar
+local function fetchServersFromHost(host, placeId)
+    local servers = {}
+    local cursor = ""
+    local lastErr = nil
+
+    for page = 1, PAGES_TO_SCAN do
+        local url = "https://" .. host .. "/v1/games/" .. placeId ..
+            "/servers/Public?sortOrder=Asc&excludeFullGames=false&limit=" .. SERVERS_PER_PAGE
+        if cursor ~= "" then
+            url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+        end
+
+        local body, err = httpGet(url)
+        if not body then
+            lastErr = "GET servers (" .. host .. ", pagina " .. page .. ") falhou -> " .. tostring(err)
+            break
+        end
+
+        local ok, decoded = pcall(HttpService.JSONDecode, HttpService, body)
+        if not ok or not decoded then
+            lastErr = "JSON invalido (" .. host .. ", pagina " .. page .. "). Corpo: " .. tostring(body):sub(1, 150)
+            break
+        end
+
+        if decoded.errors then
+            local msg = decoded.errors[1] and decoded.errors[1].message or "erro desconhecido"
+            lastErr = "API (" .. host .. ") respondeu com erro: " .. tostring(msg)
+            break
+        end
+
+        for _, s in ipairs(decoded.data or {}) do
+            table.insert(servers, s)
+        end
+
+        cursor = decoded.nextPageCursor
+        if not cursor or cursor == "" then break end
+    end
+
+    return servers, lastErr
+end
+
+local function fetchServers(placeId)
+    local lastErr = nil
+    for _, host in ipairs(API_HOSTS) do
+        local servers, err = fetchServersFromHost(host, placeId)
+        if servers and #servers > 0 then
+            return servers, nil
+        end
+        lastErr = err
+    end
+    return {}, lastErr or "Nenhum host de API respondeu."
+end
+
+-- Pontua servidor: prioriza poucos players, e usa o ping como
+-- desempate pra dar mais estabilidade (menos players + bom ping).
+local function getTopLowPopServers()
+    local servers, sErr = fetchServers(PLACE_ID)
+    if #servers == 0 then
+        return nil, sErr or "A API nao retornou nenhum servidor publico (pode ser bloqueio de rede do executor)."
+    end
+
+    -- Ping pesa muito mais agora: cada 10ms de ping conta como 1 "jogador"
+    -- na pontuação, entao um servidor com 30ms e 15 players pode ranquear
+    -- melhor que um com 5 players mas 200ms.
+    table.sort(servers, function(a, b)
+        local aScore = (a.playing or 0) + ((a.ping or 250) / 10)
+        local bScore = (b.playing or 0) + ((b.ping or 250) / 10)
+        return aScore < bScore
+    end)
+
+    local top = {}
+    for i = 1, math.min(TOP_N, #servers) do
+        top[i] = servers[i]
+    end
+    return top
+end
+
+local function pingColor(ping)
+    if not ping then return TEXT_DIM end
+    if ping <= 120 then return GREEN end
+    return RED
+end
+
+-- =====================================================================
+-- GUI helpers
+-- =====================================================================
+local function addShadow(frame)
+    local shadow = Instance.new("ImageLabel")
+    shadow.Name = "Shadow"
+    shadow.BackgroundTransparency = 1
+    shadow.Image = SHADOW_IMAGE
+    shadow.ImageColor3 = Color3.new(0, 0, 0)
+    shadow.ImageTransparency = 0.3
+    shadow.ScaleType = Enum.ScaleType.Slice
+    shadow.SliceCenter = SHADOW_SLICE
+    shadow.Size = UDim2.new(1, 46, 1, 46)
+    shadow.Position = UDim2.new(0.5, 0, 0.5, 5)
+    shadow.AnchorPoint = Vector2.new(0.5, 0.5)
+    shadow.ZIndex = 0
+    shadow.Parent = frame
+    return shadow
+end
+
+local function addStroke(frame, thickness, transparency)
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = STROKE
+    stroke.Thickness = thickness or 1
+    stroke.Transparency = transparency or 0.6
+    stroke.Parent = frame
+    return stroke
+end
+
+local function addGradient(frame, colorSeq, rotation)
+    local grad = Instance.new("UIGradient")
+    grad.Color = colorSeq
+    grad.Rotation = rotation or 90
+    grad.Parent = frame
+    return grad
+end
+
+local function popIn(frame)
+    local target = frame.Size
+    frame.Size = UDim2.new(target.X.Scale, target.X.Offset, 0, 0)
+    frame.BackgroundTransparency = 1
+    local tween = TweenService:Create(frame,
+        TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { Size = target, BackgroundTransparency = 0 }
+    )
+    tween:Play()
+end
+
+local function hoverTween(guiObject, propTable, time)
+    return TweenService:Create(guiObject, TweenInfo.new(time or 0.15, Enum.EasingStyle.Quad), propTable)
+end
+
+local function makeDraggable(dragHandle, frame)
+    local dragging, dragStart, startPos
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    dragHandle.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+-- rainbow: quando true, aplica um UIGradient animado no texto do título
+local function newTitlebar(parent, title, onClose, rainbowTitle)
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, 0, 0, 34)
+    bar.BackgroundColor3 = BG_TITLEBAR
+    bar.BorderSizePixel = 0
+    bar.ZIndex = 3
+    bar.Parent = parent
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 10)
+    corner.Parent = bar
+
+    local maskBottom = Instance.new("Frame")
+    maskBottom.BackgroundColor3 = BG_TITLEBAR
+    maskBottom.BorderSizePixel = 0
+    maskBottom.Size = UDim2.new(1, 0, 0, 10)
+    maskBottom.Position = UDim2.new(0, 0, 1, -10)
+    maskBottom.ZIndex = 2
+    maskBottom.Parent = bar
+
+    addGradient(bar, ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 20, 22)),
+        ColorSequenceKeypoint.new(1, BG_TITLEBAR),
+    }), 90)
+
+    local accentLine = Instance.new("Frame")
+    accentLine.BackgroundColor3 = ACCENT
+    accentLine.BorderSizePixel = 0
+    accentLine.Size = UDim2.new(1, 0, 0, 2)
+    accentLine.ZIndex = 4
+    accentLine.Parent = bar
+    local accentCorner = Instance.new("UICorner")
+    accentCorner.CornerRadius = UDim.new(1, 0)
+    accentCorner.Parent = accentLine
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.Size = UDim2.new(1, -44, 1, 0)
+    titleLbl.Position = UDim2.new(0, 12, 0, 1)
+    titleLbl.Font = Enum.Font.GothamBold
+    titleLbl.TextSize = 13
+    titleLbl.TextColor3 = TEXT
+    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
+    titleLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    titleLbl.Text = title
+    titleLbl.ZIndex = 4
+    titleLbl.Parent = bar
+
+    if rainbowTitle then
+        local rainbow = Instance.new("UIGradient")
+        rainbow.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0.00, Color3.fromHSV(0.00, 0.85, 1)),
+            ColorSequenceKeypoint.new(0.17, Color3.fromHSV(0.17, 0.85, 1)),
+            ColorSequenceKeypoint.new(0.34, Color3.fromHSV(0.34, 0.85, 1)),
+            ColorSequenceKeypoint.new(0.51, Color3.fromHSV(0.51, 0.85, 1)),
+            ColorSequenceKeypoint.new(0.68, Color3.fromHSV(0.68, 0.85, 1)),
+            ColorSequenceKeypoint.new(0.85, Color3.fromHSV(0.85, 0.85, 1)),
+            ColorSequenceKeypoint.new(1.00, Color3.fromHSV(1.00, 0.85, 1)),
+        })
+        rainbow.Parent = titleLbl
+
+        local connection
+        connection = RunService.Heartbeat:Connect(function(dt)
+            if not titleLbl.Parent then
+                connection:Disconnect()
+                return
+            end
+            rainbow.Offset = Vector2.new((rainbow.Offset.X + dt * 0.15) % 1, 0)
+        end)
+    end
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 24, 0, 24)
+    closeBtn.Position = UDim2.new(1, -30, 0.5, -12)
+    closeBtn.BackgroundColor3 = BG_ROW_HOVER
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.AutoButtonColor = false
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 13
+    closeBtn.TextColor3 = TEXT_DIM
+    closeBtn.Text = "X"
+    closeBtn.ZIndex = 4
+    closeBtn.Parent = bar
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(1, 0)
+    closeCorner.Parent = closeBtn
+
+    closeBtn.MouseEnter:Connect(function()
+        hoverTween(closeBtn, { BackgroundTransparency = 0, TextColor3 = TEXT }):Play()
+    end)
+    closeBtn.MouseLeave:Connect(function()
+        hoverTween(closeBtn, { BackgroundTransparency = 1, TextColor3 = TEXT_DIM }):Play()
+    end)
+    closeBtn.MouseButton1Click:Connect(onClose)
+
+    return bar
+end
+
+-- =====================================================================
+-- ScreenGui raiz
+-- =====================================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ServerFinder"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = (gethui and gethui()) or LocalPlayer:WaitForChild("PlayerGui")
+
+-- ---------------------------------------------------------------------
+-- Janela principal
+-- ---------------------------------------------------------------------
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 270, 0, 150)
+mainFrame.Position = UDim2.new(0, 40, 0, 120)
+mainFrame.BackgroundColor3 = BG
+mainFrame.BorderSizePixel = 0
+mainFrame.ClipsDescendants = false
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 10)
+mainCorner.Parent = mainFrame
+
+addGradient(mainFrame, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, BG_GRAD_TOP),
+    ColorSequenceKeypoint.new(1, BG_GRAD_BOT),
+}), 90)
+addStroke(mainFrame, 1, 0.55)
+addShadow(mainFrame)
+
+local mainBar = newTitlebar(mainFrame, "Server Finder - Developed by Jota", function()
+    screenGui:Destroy()
+end, true)
+makeDraggable(mainBar, mainFrame)
+
+local refreshBtn = Instance.new("TextButton")
+refreshBtn.Size = UDim2.new(1, -24, 0, 42)
+refreshBtn.Position = UDim2.new(0, 12, 0, 56)
+refreshBtn.BackgroundColor3 = ACCENT
+refreshBtn.Font = Enum.Font.GothamBold
+refreshBtn.TextSize = 15
+refreshBtn.TextColor3 = Color3.fromRGB(24, 24, 26)
+refreshBtn.Text = "Refresh"
+refreshBtn.AutoButtonColor = false
+refreshBtn.ZIndex = 3
+refreshBtn.Parent = mainFrame
+
+local refreshCorner = Instance.new("UICorner")
+refreshCorner.CornerRadius = UDim.new(0, 8)
+refreshCorner.Parent = refreshBtn
+
+addGradient(refreshBtn, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, ACCENT),
+    ColorSequenceKeypoint.new(1, ACCENT_DIM),
+}), 90)
+
+refreshBtn.MouseEnter:Connect(function()
+    hoverTween(refreshBtn, { Size = UDim2.new(1, -20, 0, 44) }):Play()
+end)
+refreshBtn.MouseLeave:Connect(function()
+    hoverTween(refreshBtn, { Size = UDim2.new(1, -24, 0, 42) }):Play()
+end)
+refreshBtn.MouseButton1Down:Connect(function()
+    hoverTween(refreshBtn, { Size = UDim2.new(1, -28, 0, 40) }, 0.08):Play()
+end)
+
+local hintLbl = Instance.new("TextLabel")
+hintLbl.BackgroundTransparency = 1
+hintLbl.Size = UDim2.new(1, -24, 0, 20)
+hintLbl.Position = UDim2.new(0, 12, 0, 106)
+hintLbl.Font = Enum.Font.Gotham
+hintLbl.TextSize = 12
+hintLbl.TextColor3 = TEXT_DIM
+hintLbl.TextXAlignment = Enum.TextXAlignment.Left
+hintLbl.Text = ""
+hintLbl.ZIndex = 3
+hintLbl.Parent = mainFrame
+
+popIn(mainFrame)
+
+-- ---------------------------------------------------------------------
+-- Janelinha de resultados (popup)
+-- ---------------------------------------------------------------------
+local popupFrame = Instance.new("Frame")
+popupFrame.Size = UDim2.new(0, 310, 0, 410)
+popupFrame.Position = UDim2.new(0, 330, 0, 120)
+popupFrame.BackgroundColor3 = BG_CARD
+popupFrame.BorderSizePixel = 0
+popupFrame.ClipsDescendants = false
+popupFrame.Visible = false
+popupFrame.Parent = screenGui
+
+local popupCorner = Instance.new("UICorner")
+popupCorner.CornerRadius = UDim.new(0, 10)
+popupCorner.Parent = popupFrame
+
+addGradient(popupFrame, ColorSequence.new({
+    ColorSequenceKeypoint.new(0, BG_GRAD_TOP),
+    ColorSequenceKeypoint.new(1, BG_GRAD_BOT),
+}), 90)
+addStroke(popupFrame, 1, 0.55)
+addShadow(popupFrame)
+
+local popupBar = newTitlebar(popupFrame, "Servidores com menos players", function()
+    popupFrame.Visible = false
+end, false)
+makeDraggable(popupBar, popupFrame)
+
+local statusLbl = Instance.new("TextLabel")
+statusLbl.BackgroundTransparency = 1
+statusLbl.Size = UDim2.new(1, -20, 0, 20)
+statusLbl.Position = UDim2.new(0, 12, 0, 42)
+statusLbl.Font = Enum.Font.Gotham
+statusLbl.TextSize = 12
+statusLbl.TextColor3 = TEXT_DIM
+statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
+statusLbl.ZIndex = 3
+statusLbl.Text = "Carregando..."
+statusLbl.Parent = popupFrame
+
+local colHeader = Instance.new("Frame")
+colHeader.BackgroundTransparency = 1
+colHeader.Size = UDim2.new(1, -20, 0, 16)
+colHeader.Position = UDim2.new(0, 12, 0, 64)
+colHeader.ZIndex = 3
+colHeader.Parent = popupFrame
+
+local function headerLbl(text, xOffset, width)
+    local l = Instance.new("TextLabel")
+    l.BackgroundTransparency = 1
+    l.Size = UDim2.new(0, width, 1, 0)
+    l.Position = UDim2.new(0, xOffset, 0, 0)
+    l.Font = Enum.Font.GothamBold
+    l.TextSize = 11
+    l.TextColor3 = TEXT_DIM
+    l.TextTransparency = 0.2
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Text = text
+    l.ZIndex = 3
+    l.Parent = colHeader
+end
+headerLbl("#", 6, 26)
+headerLbl("JOGADORES", 34, 90)
+headerLbl("PING", 126, 90)
+
+local listFrame = Instance.new("ScrollingFrame")
+listFrame.Size = UDim2.new(1, -20, 1, -92)
+listFrame.Position = UDim2.new(0, 10, 0, 84)
+listFrame.BackgroundTransparency = 1
+listFrame.BorderSizePixel = 0
+listFrame.ScrollBarThickness = 3
+listFrame.ScrollBarImageColor3 = ACCENT
+listFrame.ScrollBarImageTransparency = 0.3
+listFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+listFrame.ZIndex = 3
+listFrame.Parent = popupFrame
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.Parent = listFrame
+
+listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    listFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y)
+end)
+
+local function clearList()
+    for _, child in ipairs(listFrame:GetChildren()) do
+        if child:IsA("Frame") or child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+end
+
+local function buildResults(servers)
+    clearList()
+    if not servers or #servers == 0 then
+        statusLbl.Text = "Nenhum servidor encontrado."
+        return
+    end
+    statusLbl.Text = "Top " .. #servers .. " servidores — clique pra entrar"
+
+    for i, s in ipairs(servers) do
+        local baseColor = (i % 2 == 0) and BG_ROW_ALT or BG_ROW
+
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, 34)
+        row.BackgroundColor3 = baseColor
+        row.AutoButtonColor = false
+        row.Text = ""
+        row.LayoutOrder = i
+        row.ZIndex = 3
+        row.Parent = listFrame
+
+        local rowCorner = Instance.new("UICorner")
+        rowCorner.CornerRadius = UDim.new(0, 6)
+        rowCorner.Parent = row
+
+        local rankBadge = Instance.new("Frame")
+        rankBadge.Size = UDim2.new(0, 22, 0, 22)
+        rankBadge.Position = UDim2.new(0, 6, 0.5, -11)
+        rankBadge.BackgroundColor3 = BG_TITLEBAR
+        rankBadge.BorderSizePixel = 0
+        rankBadge.ZIndex = 4
+        rankBadge.Parent = row
+        local rankCorner = Instance.new("UICorner")
+        rankCorner.CornerRadius = UDim.new(1, 0)
+        rankCorner.Parent = rankBadge
+
+        local rankLbl = Instance.new("TextLabel")
+        rankLbl.BackgroundTransparency = 1
+        rankLbl.Size = UDim2.new(1, 0, 1, 0)
+        rankLbl.Font = Enum.Font.GothamBold
+        rankLbl.TextSize = 12
+        rankLbl.TextColor3 = ACCENT
+        rankLbl.Text = tostring(i)
+        rankLbl.ZIndex = 5
+        rankLbl.Parent = rankBadge
+
+        local playersLbl = Instance.new("TextLabel")
+        playersLbl.BackgroundTransparency = 1
+        playersLbl.Size = UDim2.new(0, 88, 1, 0)
+        playersLbl.Position = UDim2.new(0, 36, 0, 0)
+        playersLbl.Font = Enum.Font.GothamMedium
+        playersLbl.TextSize = 13
+        playersLbl.TextColor3 = TEXT
+        playersLbl.TextXAlignment = Enum.TextXAlignment.Left
+        playersLbl.Text = tostring(s.playing or "?") .. "/" .. tostring(s.maxPlayers or "?")
+        playersLbl.ZIndex = 4
+        playersLbl.Parent = row
+
+        local pingDot = Instance.new("Frame")
+        pingDot.Size = UDim2.new(0, 8, 0, 8)
+        pingDot.Position = UDim2.new(0, 128, 0.5, -4)
+        pingDot.BackgroundColor3 = pingColor(s.ping)
+        pingDot.BorderSizePixel = 0
+        pingDot.ZIndex = 4
+        pingDot.Parent = row
+        local dotCorner = Instance.new("UICorner")
+        dotCorner.CornerRadius = UDim.new(1, 0)
+        dotCorner.Parent = pingDot
+
+        local pingLbl = Instance.new("TextLabel")
+        pingLbl.BackgroundTransparency = 1
+        pingLbl.Size = UDim2.new(0, 80, 1, 0)
+        pingLbl.Position = UDim2.new(0, 142, 0, 0)
+        pingLbl.Font = Enum.Font.GothamBold
+        pingLbl.TextSize = 13
+        pingLbl.TextColor3 = pingColor(s.ping)
+        pingLbl.TextXAlignment = Enum.TextXAlignment.Left
+        pingLbl.Text = (s.ping and (s.ping .. " ms")) or "N/D"
+        pingLbl.ZIndex = 4
+        pingLbl.Parent = row
+
+        local joinHint = Instance.new("TextLabel")
+        joinHint.BackgroundTransparency = 1
+        joinHint.Size = UDim2.new(0, 60, 1, 0)
+        joinHint.Position = UDim2.new(1, -58, 0, 0)
+        joinHint.Font = Enum.Font.GothamBold
+        joinHint.TextSize = 11
+        joinHint.TextColor3 = ACCENT
+        joinHint.TextTransparency = 1
+        joinHint.TextXAlignment = Enum.TextXAlignment.Right
+        joinHint.Text = "ENTRAR"
+        joinHint.ZIndex = 4
+        joinHint.Parent = row
+
+        row.MouseEnter:Connect(function()
+            hoverTween(row, { BackgroundColor3 = BG_ROW_HOVER }):Play()
+            hoverTween(joinHint, { TextTransparency = 0 }):Play()
+        end)
+        row.MouseLeave:Connect(function()
+            hoverTween(row, { BackgroundColor3 = baseColor }):Play()
+            hoverTween(joinHint, { TextTransparency = 1 }):Play()
+        end)
+
+        row.MouseButton1Click:Connect(function()
+            statusLbl.Text = "Entrando no servidor " .. i .. "..."
+            local ok, err = pcall(function()
+                TeleportService:TeleportToPlaceInstance(PLACE_ID, s.id, LocalPlayer)
+            end)
+            if not ok then
+                statusLbl.Text = "Erro ao entrar: " .. tostring(err)
+            end
+        end)
+    end
+end
+
+local isFetching = false
+
+local function doRefresh()
+    if isFetching then return end
+    isFetching = true
+
+    local wasHidden = not popupFrame.Visible
+    popupFrame.Visible = true
+    if wasHidden then
+        popIn(popupFrame)
+    end
+
+    statusLbl.Text = "Buscando servidores..."
+    clearList()
+    hintLbl.Text = "Procurando os servidores com menos jogadores..."
+    refreshBtn.Text = "Refreshing..."
+
+    task.spawn(function()
+        local servers, err = getTopLowPopServers()
+        isFetching = false
+        hintLbl.Text = ""
+        refreshBtn.Text = "Refresh"
+        if not servers then
+            statusLbl.Text = "Erro: " .. tostring(err)
+            return
+        end
+        buildResults(servers)
+    end)
+end
+
+refreshBtn.MouseButton1Click:Connect(doRefresh)
