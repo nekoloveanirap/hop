@@ -1,3 +1,14 @@
+-- =====================================================================
+-- SERVER FINDER - TEMA ROSA COM ALTO CONTRASTE
+-- CORES: ROSA + BRANCO + CINZA ESCURO, COM ALTO CONTRASTE
+--
+-- BOTOES:
+-- 1. "Refresh"     = atualiza/procura servidores
+-- 2. "Server Hop"  = entra no servidor selecionado
+-- 3. "X"           = fecha a janela
+-- 4. Linhas da lista = selecionam um servidor
+-- =====================================================================
+
 local Players          = game:GetService("Players")
 local HttpService       = game:GetService("HttpService")
 local TeleportService   = game:GetService("TeleportService")
@@ -8,32 +19,46 @@ local LocalPlayer = Players.LocalPlayer
 local PLACE_ID = game.PlaceId
 
 local SERVERS_PER_PAGE = 100
-local PAGES_TO_SCAN    = 6
-local TOP_N            = 20
+local PAGES_TO_SCAN    = 25     -- ate ~2500 servers escaneados, pra achar mais ping baixo
+local TOP_N            = 30
+local MIN_LOW_PING     = 5      -- minimo de servers com ping <= LOW_PING_THRESHOLD
+local LOW_PING_THRESHOLD = 30   -- ms
 
--- Hosts tentados em ordem. O segundo é um proxy publico que costuma
--- resolver bloqueios/erros de CORS ao chamar a API da Roblox direto
--- de dentro de um executor.
 local API_HOSTS = { "games.roblox.com", "games.roproxy.com" }
 
 -- =====================================================================
--- Tema neutro (cinza/prata) — a única cor que varia é o ping (ms)
+-- Tema: rosa claro e bonito sobre fundo claro (nao mais dark).
 -- =====================================================================
-local BG           = Color3.fromRGB(24, 24, 26)
-local BG_GRAD_TOP  = Color3.fromRGB(30, 30, 33)
-local BG_GRAD_BOT  = Color3.fromRGB(18, 18, 20)
-local BG_TITLEBAR  = Color3.fromRGB(16, 16, 18)
-local BG_CARD      = Color3.fromRGB(28, 28, 31)
-local BG_ROW       = Color3.fromRGB(34, 34, 37)
-local BG_ROW_ALT   = Color3.fromRGB(39, 39, 43)
-local BG_ROW_HOVER = Color3.fromRGB(48, 48, 53)
-local ACCENT       = Color3.fromRGB(180, 180, 186)
-local ACCENT_DIM   = Color3.fromRGB(130, 130, 136)
-local STROKE       = Color3.fromRGB(95, 95, 102)
-local TEXT         = Color3.fromRGB(232, 232, 236)
-local TEXT_DIM     = Color3.fromRGB(146, 146, 152)
-local GREEN        = Color3.fromRGB(110, 220, 140)
-local RED          = Color3.fromRGB(230, 92, 92)
+-- =====================================================================
+-- Tema: rosa claro, bonito e com botoes bem diferenciados
+-- =====================================================================
+local BG           = Color3.fromRGB(255, 255, 255)
+local BG_GRAD_TOP  = Color3.fromRGB(255, 255, 255)
+local BG_GRAD_BOT  = Color3.fromRGB(255, 255, 255)
+local BG_TITLEBAR  = Color3.fromRGB(248, 205, 224)
+local BG_CARD      = Color3.fromRGB(255, 255, 255)
+local BG_ROW       = Color3.fromRGB(255, 255, 255)
+local BG_ROW_ALT   = Color3.fromRGB(250, 245, 248)
+local BG_ROW_HOVER = Color3.fromRGB(255, 232, 241)
+
+-- Rosa principal
+local ACCENT       = Color3.fromRGB(205, 58, 112)
+local ACCENT_DIM   = Color3.fromRGB(150, 110, 125)
+
+-- Contornos FINOS e neutros: servem so para separar, sem competir com o texto
+local STROKE       = Color3.fromRGB(185, 185, 185)
+local TITLE_ACCENT = Color3.fromRGB(214, 78, 128)
+local TITLE_DEEP   = Color3.fromRGB(175, 65, 105)
+
+local TEXT         = Color3.fromRGB(48, 48, 52)
+local TEXT_DIM     = Color3.fromRGB(105, 105, 110)
+
+-- Estados de ping
+local GREEN        = Color3.fromRGB(35, 135, 88)
+local RED          = Color3.fromRGB(190, 60, 82)
+
+-- Texto sobre botoes rosas
+local ON_ACCENT    = Color3.fromRGB(255, 255, 255)
 
 local SHADOW_IMAGE = "rbxassetid://6015897843"
 local SHADOW_SLICE = Rect.new(49, 49, 450, 450)
@@ -48,7 +73,6 @@ local REQUEST_HEADERS = {
 
 local function tryRequesters(url)
     local attempts = {}
-
     if syn and syn.request then
         table.insert(attempts, {"syn.request", function()
             local res = syn.request({ Url = url, Method = "GET", Headers = REQUEST_HEADERS })
@@ -71,31 +95,35 @@ local function tryRequesters(url)
         local body = game:HttpGet(url)
         return 200, body
     end})
-
     return attempts
 end
 
 local function httpGet(url)
     local attempts = tryRequesters(url)
-    local lastErr = "nenhuma funcao de HTTP disponivel neste executor"
+    local lastErr = "no HTTP function available in this executor"
 
     for _, attempt in ipairs(attempts) do
         local name, fn = attempt[1], attempt[2]
         local ok, status, body = pcall(fn)
         if ok and body and body ~= "" then
-            return body
-        end
-        if ok then
-            lastErr = string.format("[%s] status=%s corpo vazio", name, tostring(status))
+            -- FIX: as vezes vem HTML de erro (ex: cloudflare/proxy) em vez de JSON.
+            -- Filtra aqui pra nao mandar lixo pro JSONDecode.
+            local trimmed = body:match("^%s*(.-)%s*$")
+            if trimmed:sub(1, 1) == "{" or trimmed:sub(1, 1) == "[" then
+                return body
+            else
+                lastErr = string.format("[%s] non-JSON response (likely error/HTML)", name)
+            end
+        elseif ok then
+            lastErr = string.format("[%s] status=%s empty body", name, tostring(status))
         else
-            lastErr = string.format("[%s] erro: %s", name, tostring(status))
+            lastErr = string.format("[%s] error: %s", name, tostring(status))
         end
         print("[ServerFinder] " .. lastErr)
     end
     return nil, lastErr
 end
 
--- Busca servidores tentando cada host da lista até um funcionar
 local function fetchServersFromHost(host, placeId)
     local servers = {}
     local cursor = ""
@@ -110,24 +138,28 @@ local function fetchServersFromHost(host, placeId)
 
         local body, err = httpGet(url)
         if not body then
-            lastErr = "GET servers (" .. host .. ", pagina " .. page .. ") falhou -> " .. tostring(err)
-            break
+            lastErr = "GET servers (" .. host .. ", page " .. page .. ") failed -> " .. tostring(err)
+            break -- host inteiro sem resposta valida, desiste desse host
         end
 
         local ok, decoded = pcall(HttpService.JSONDecode, HttpService, body)
-        if not ok or not decoded then
-            lastErr = "JSON invalido (" .. host .. ", pagina " .. page .. "). Corpo: " .. tostring(body):sub(1, 150)
+        if not ok or type(decoded) ~= "table" then
+            -- FIX: pagina especifica com JSON ruim nao derruba tudo,
+            -- so para de paginar esse host e fica com o que ja tem.
+            lastErr = "Invalid JSON (" .. host .. ", page " .. page .. ")"
             break
         end
 
         if decoded.errors then
-            local msg = decoded.errors[1] and decoded.errors[1].message or "erro desconhecido"
-            lastErr = "API (" .. host .. ") respondeu com erro: " .. tostring(msg)
+            local msg = decoded.errors[1] and decoded.errors[1].message or "unknown error"
+            lastErr = "API (" .. host .. ") returned an error: " .. tostring(msg)
             break
         end
 
-        for _, s in ipairs(decoded.data or {}) do
-            table.insert(servers, s)
+        if type(decoded.data) == "table" then
+            for _, s in ipairs(decoded.data) do
+                table.insert(servers, s)
+            end
         end
 
         cursor = decoded.nextPageCursor
@@ -140,37 +172,55 @@ end
 local function fetchServers(placeId)
     local lastErr = nil
     for _, host in ipairs(API_HOSTS) do
-        local servers, err = fetchServersFromHost(host, placeId)
-        if servers and #servers > 0 then
+        local ok, servers, err = pcall(fetchServersFromHost, host, placeId)
+        if ok and servers and #servers > 0 then
             return servers, nil
         end
-        lastErr = err
+        lastErr = (ok and err) or tostring(servers)
     end
-    return {}, lastErr or "Nenhum host de API respondeu."
+    return {}, lastErr or "No API host responded."
 end
 
--- Pontua servidor: prioriza poucos players, e usa o ping como
--- desempate pra dar mais estabilidade (menos players + bom ping).
+-- FIX: agora garante MIN_LOW_PING servers com ping <= LOW_PING_THRESHOLD
+-- no topo da lista (se existirem), e completa o resto ate TOP_N pelo
+-- score de sempre (poucos players + ping bom).
 local function getTopLowPopServers()
     local servers, sErr = fetchServers(PLACE_ID)
     if #servers == 0 then
-        return nil, sErr or "A API nao retornou nenhum servidor publico (pode ser bloqueio de rede do executor)."
+        return nil, sErr or "The API returned no public servers (might be a network block in your executor)."
     end
 
-    -- Ping pesa muito mais agora: cada 10ms de ping conta como 1 "jogador"
-    -- na pontuação, entao um servidor com 30ms e 15 players pode ranquear
-    -- melhor que um com 5 players mas 200ms.
-    table.sort(servers, function(a, b)
-        local aScore = (a.playing or 0) + ((a.ping or 250) / 10)
-        local bScore = (b.playing or 0) + ((b.ping or 250) / 10)
-        return aScore < bScore
-    end)
-
-    local top = {}
-    for i = 1, math.min(TOP_N, #servers) do
-        top[i] = servers[i]
+    local function score(s)
+        return (s.playing or 0) + ((s.ping or 250) / 10)
     end
-    return top
+
+    -- separa quem tem ping baixo
+    local lowPing, rest = {}, {}
+    for _, s in ipairs(servers) do
+        if s.ping and s.ping <= LOW_PING_THRESHOLD then
+            table.insert(lowPing, s)
+        else
+            table.insert(rest, s)
+        end
+    end
+
+    table.sort(lowPing, function(a, b) return score(a) < score(b) end)
+    table.sort(rest, function(a, b) return score(a) < score(b) end)
+
+    local top, seen = {}, {}
+    local function push(s)
+        if not seen[s.id] and #top < TOP_N then
+            seen[s.id] = true
+            table.insert(top, s)
+        end
+    end
+
+    -- prioridade total: todo mundo com ping <= 30ms entra primeiro, na ordem,
+    -- so depois completa com o resto ate bater TOP_N
+    for i = 1, #lowPing do push(lowPing[i]) end
+    for i = 1, #rest do push(rest[i]) end
+
+    return top, #lowPing
 end
 
 local function pingColor(ping)
@@ -183,25 +233,13 @@ end
 -- GUI helpers
 -- =====================================================================
 local function addShadow(frame)
-    local shadow = Instance.new("ImageLabel")
-    shadow.Name = "Shadow"
-    shadow.BackgroundTransparency = 1
-    shadow.Image = SHADOW_IMAGE
-    shadow.ImageColor3 = Color3.new(0, 0, 0)
-    shadow.ImageTransparency = 0.3
-    shadow.ScaleType = Enum.ScaleType.Slice
-    shadow.SliceCenter = SHADOW_SLICE
-    shadow.Size = UDim2.new(1, 46, 1, 46)
-    shadow.Position = UDim2.new(0.5, 0, 0.5, 5)
-    shadow.AnchorPoint = Vector2.new(0.5, 0.5)
-    shadow.ZIndex = 0
-    shadow.Parent = frame
-    return shadow
+    -- Sem sombra: evita qualquer vazamento visual para fora da UI.
+    return nil
 end
 
-local function addStroke(frame, thickness, transparency)
+local function addStroke(frame, thickness, transparency, color)
     local stroke = Instance.new("UIStroke")
-    stroke.Color = STROKE
+    stroke.Color = color or STROKE
     stroke.Thickness = thickness or 1
     stroke.Transparency = transparency or 0.6
     stroke.Parent = frame
@@ -258,10 +296,10 @@ local function makeDraggable(dragHandle, frame)
     end)
 end
 
--- rainbow: quando true, aplica um UIGradient animado no texto do título
-local function newTitlebar(parent, title, onClose, rainbowTitle)
+-- Titlebar rosa claro com contraste limpo.
+local function newTitlebar(parent, title, onClose)
     local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(1, 0, 0, 34)
+    bar.Size = UDim2.new(1, 0, 0, 38)
     bar.BackgroundColor3 = BG_TITLEBAR
     bar.BorderSizePixel = 0
     bar.ZIndex = 3
@@ -279,58 +317,87 @@ local function newTitlebar(parent, title, onClose, rainbowTitle)
     maskBottom.ZIndex = 2
     maskBottom.Parent = bar
 
-    addGradient(bar, ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(20, 20, 22)),
-        ColorSequenceKeypoint.new(1, BG_TITLEBAR),
-    }), 90)
 
-    local accentLine = Instance.new("Frame")
-    accentLine.BackgroundColor3 = ACCENT
-    accentLine.BorderSizePixel = 0
-    accentLine.Size = UDim2.new(1, 0, 0, 2)
-    accentLine.ZIndex = 4
-    accentLine.Parent = bar
-    local accentCorner = Instance.new("UICorner")
-    accentCorner.CornerRadius = UDim.new(1, 0)
-    accentCorner.Parent = accentLine
+    -- Logo centralizada em rosa e branco
+    local logoCircle = Instance.new("Frame")
+    logoCircle.Size = UDim2.new(0, 26, 0, 26)
+    logoCircle.AnchorPoint = Vector2.new(0.5, 0.5)
+    logoCircle.Position = UDim2.new(0.5, -12, 0.5, 0)
+    logoCircle.BackgroundColor3 = BG_CARD
+    logoCircle.BorderSizePixel = 0
+    logoCircle.ClipsDescendants = false
+    logoCircle.ZIndex = 4
+    logoCircle.Parent = bar
+    local logoCircleCorner = Instance.new("UICorner")
+    logoCircleCorner.CornerRadius = UDim.new(1, 0)
+    logoCircleCorner.Parent = logoCircle
+    addStroke(logoCircle, 1, 0.55, Color3.fromRGB(175, 175, 175))
 
-    local titleLbl = Instance.new("TextLabel")
-    titleLbl.BackgroundTransparency = 1
-    titleLbl.Size = UDim2.new(1, -44, 1, 0)
-    titleLbl.Position = UDim2.new(0, 12, 0, 1)
-    titleLbl.Font = Enum.Font.GothamBold
-    titleLbl.TextSize = 13
-    titleLbl.TextColor3 = TEXT
-    titleLbl.TextXAlignment = Enum.TextXAlignment.Left
-    titleLbl.TextTruncate = Enum.TextTruncate.AtEnd
-    titleLbl.Text = title
-    titleLbl.ZIndex = 4
-    titleLbl.Parent = bar
-
-    if rainbowTitle then
-        local rainbow = Instance.new("UIGradient")
-        rainbow.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0.00, Color3.fromHSV(0.00, 0.85, 1)),
-            ColorSequenceKeypoint.new(0.17, Color3.fromHSV(0.17, 0.85, 1)),
-            ColorSequenceKeypoint.new(0.34, Color3.fromHSV(0.34, 0.85, 1)),
-            ColorSequenceKeypoint.new(0.51, Color3.fromHSV(0.51, 0.85, 1)),
-            ColorSequenceKeypoint.new(0.68, Color3.fromHSV(0.68, 0.85, 1)),
-            ColorSequenceKeypoint.new(0.85, Color3.fromHSV(0.85, 0.85, 1)),
-            ColorSequenceKeypoint.new(1.00, Color3.fromHSV(1.00, 0.85, 1)),
-        })
-        rainbow.Parent = titleLbl
-
-        local connection
-        connection = RunService.Heartbeat:Connect(function(dt)
-            if not titleLbl.Parent then
-                connection:Disconnect()
-                return
-            end
-            rainbow.Offset = Vector2.new((rainbow.Offset.X + dt * 0.15) % 1, 0)
-        end)
+    -- orelhas
+    local function catEar(xOffset)
+        local ear = Instance.new("Frame")
+        ear.Size = UDim2.new(0, 9, 0, 9)
+        ear.AnchorPoint = Vector2.new(0.5, 0.5)
+        ear.Position = UDim2.new(0, xOffset, 0, 2)
+        ear.Rotation = 45
+        ear.BackgroundColor3 = TITLE_ACCENT
+        ear.BorderSizePixel = 0
+        ear.ZIndex = 4
+        ear.Parent = logoCircle
+        local earCorner = Instance.new("UICorner")
+        earCorner.CornerRadius = UDim.new(0, 2)
+        earCorner.Parent = ear
     end
+    catEar(7)
+    catEar(19)
 
-    local closeBtn = Instance.new("TextButton")
+    -- rosto
+    local face = Instance.new("Frame")
+    face.Size = UDim2.new(0, 21, 0, 18)
+    face.AnchorPoint = Vector2.new(0.5, 0.5)
+    face.Position = UDim2.new(0.5, 0, 0.58, 0)
+    face.BackgroundColor3 = TITLE_ACCENT
+    face.BorderSizePixel = 0
+    face.ZIndex = 5
+    face.Parent = logoCircle
+    local faceCorner = Instance.new("UICorner")
+    faceCorner.CornerRadius = UDim.new(0, 7)
+    faceCorner.Parent = face
+
+    -- olhinhos
+    local function catEye(xOffset)
+        local eye = Instance.new("Frame")
+        eye.Size = UDim2.new(0, 2, 0, 3)
+        eye.AnchorPoint = Vector2.new(0.5, 0.5)
+        eye.Position = UDim2.new(0.5, xOffset, 0.5, -1)
+        eye.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        eye.BorderSizePixel = 0
+        eye.ZIndex = 6
+        eye.Parent = face
+        local eyeCorner = Instance.new("UICorner")
+        eyeCorner.CornerRadius = UDim.new(1, 0)
+        eyeCorner.Parent = eye
+    end
+    catEye(-5)
+    catEye(5)
+
+    -- naricinha
+    local nose = Instance.new("Frame")
+    nose.Size = UDim2.new(0, 3, 0, 2)
+    nose.AnchorPoint = Vector2.new(0.5, 0.5)
+    nose.Position = UDim2.new(0.5, 0, 0.5, 4)
+    nose.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    nose.BorderSizePixel = 0
+    nose.ZIndex = 6
+    nose.Parent = face
+    local noseCorner = Instance.new("UICorner")
+    noseCorner.CornerRadius = UDim.new(1, 0)
+    noseCorner.Parent = nose
+
+    -- BUTTON: FECHAR
+-- Texto exibido: "X"
+-- Funcao: fechar a janela/popup.
+local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 24, 0, 24)
     closeBtn.Position = UDim2.new(1, -30, 0.5, -12)
     closeBtn.BackgroundColor3 = BG_ROW_HOVER
@@ -338,19 +405,20 @@ local function newTitlebar(parent, title, onClose, rainbowTitle)
     closeBtn.AutoButtonColor = false
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 13
-    closeBtn.TextColor3 = TEXT_DIM
+    closeBtn.TextColor3 = Color3.fromRGB(70, 70, 74)
     closeBtn.Text = "X"
     closeBtn.ZIndex = 4
     closeBtn.Parent = bar
     local closeCorner = Instance.new("UICorner")
     closeCorner.CornerRadius = UDim.new(1, 0)
     closeCorner.Parent = closeBtn
+    -- Sem borda: o X fica limpo no titlebar.
 
     closeBtn.MouseEnter:Connect(function()
         hoverTween(closeBtn, { BackgroundTransparency = 0, TextColor3 = TEXT }):Play()
     end)
     closeBtn.MouseLeave:Connect(function()
-        hoverTween(closeBtn, { BackgroundTransparency = 1, TextColor3 = TEXT_DIM }):Play()
+        hoverTween(closeBtn, { BackgroundTransparency = 1, TextColor3 = Color3.fromRGB(70, 70, 74) }):Play()
     end)
     closeBtn.MouseButton1Click:Connect(onClose)
 
@@ -360,6 +428,13 @@ end
 -- =====================================================================
 -- ScreenGui raiz
 -- =====================================================================
+-- Estado de selecao do servidor (usado pelo Server Hop) e forward-declare
+-- da funcao que atualiza a aparencia do botao Server Hop.
+local selectedServer = nil
+local selectedRow = nil
+local rowBaseColors = {}
+local updateHopButtonState
+
 local screenGui = Instance.new("ScreenGui")
 screenGui.Name = "ServerFinder"
 screenGui.ResetOnSpawn = false
@@ -370,73 +445,132 @@ screenGui.Parent = (gethui and gethui()) or LocalPlayer:WaitForChild("PlayerGui"
 -- Janela principal
 -- ---------------------------------------------------------------------
 local mainFrame = Instance.new("Frame")
-mainFrame.Size = UDim2.new(0, 270, 0, 150)
+mainFrame.Size = UDim2.new(0, 270, 0, 210)
 mainFrame.Position = UDim2.new(0, 40, 0, 120)
 mainFrame.BackgroundColor3 = BG
 mainFrame.BorderSizePixel = 0
-mainFrame.ClipsDescendants = false
+mainFrame.ClipsDescendants = true
 mainFrame.Parent = screenGui
 
 local mainCorner = Instance.new("UICorner")
 mainCorner.CornerRadius = UDim.new(0, 10)
 mainCorner.Parent = mainFrame
 
-addGradient(mainFrame, ColorSequence.new({
-    ColorSequenceKeypoint.new(0, BG_GRAD_TOP),
-    ColorSequenceKeypoint.new(1, BG_GRAD_BOT),
-}), 90)
-addStroke(mainFrame, 1, 0.55)
-addShadow(mainFrame)
+-- Fundo liso e claro; sem areas cinza-escuras.
+addStroke(mainFrame, 1, 0.55, Color3.fromRGB(175, 175, 175))
 
-local mainBar = newTitlebar(mainFrame, "Server Finder - Developed by Jota", function()
+local mainBar = newTitlebar(mainFrame, nil, function()
     screenGui:Destroy()
-end, true)
+end)
 makeDraggable(mainBar, mainFrame)
 
+-- BUTTON 1 — ROSA FORTE
+-- Texto exibido: "REFRESH"
+-- Funcao: procurar/atualizar a lista de servidores.
 local refreshBtn = Instance.new("TextButton")
-refreshBtn.Size = UDim2.new(1, -24, 0, 42)
-refreshBtn.Position = UDim2.new(0, 12, 0, 56)
-refreshBtn.BackgroundColor3 = ACCENT
+refreshBtn.Size = UDim2.new(1, -24, 0, 40)
+refreshBtn.Position = UDim2.new(0, 12, 0, 48)
+refreshBtn.BackgroundColor3 = Color3.fromRGB(214, 72, 121)
 refreshBtn.Font = Enum.Font.GothamBold
 refreshBtn.TextSize = 15
-refreshBtn.TextColor3 = Color3.fromRGB(24, 24, 26)
-refreshBtn.Text = "Refresh"
+refreshBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshBtn.TextStrokeTransparency = 1
+refreshBtn.Text = "REFRESH"
 refreshBtn.AutoButtonColor = false
 refreshBtn.ZIndex = 3
 refreshBtn.Parent = mainFrame
 
 local refreshCorner = Instance.new("UICorner")
-refreshCorner.CornerRadius = UDim.new(0, 8)
+refreshCorner.CornerRadius = UDim.new(0, 10)
 refreshCorner.Parent = refreshBtn
 
-addGradient(refreshBtn, ColorSequence.new({
-    ColorSequenceKeypoint.new(0, ACCENT),
-    ColorSequenceKeypoint.new(1, ACCENT_DIM),
-}), 90)
+-- CONTORNO DO BUTTON 1: 1px, cinza neutro e discreto (nao e da mesma cor do texto)
+local refreshStroke = addStroke(refreshBtn, 1, 0.35, Color3.fromRGB(145, 145, 145))
 
 refreshBtn.MouseEnter:Connect(function()
-    hoverTween(refreshBtn, { Size = UDim2.new(1, -20, 0, 44) }):Play()
+    hoverTween(refreshBtn, { BackgroundColor3 = Color3.fromRGB(190, 48, 96) }):Play()
 end)
 refreshBtn.MouseLeave:Connect(function()
-    hoverTween(refreshBtn, { Size = UDim2.new(1, -24, 0, 42) }):Play()
+    hoverTween(refreshBtn, { BackgroundColor3 = Color3.fromRGB(214, 72, 121) }):Play()
 end)
-refreshBtn.MouseButton1Down:Connect(function()
-    hoverTween(refreshBtn, { Size = UDim2.new(1, -28, 0, 40) }, 0.08):Play()
+
+-- Server Hop: so ele teleporta, usando o servidor selecionado na lista.
+-- Comeca "desativado" (cinza claro) e vira rosa preenchido quando ha selecao.
+-- BUTTON 2 — ROSA CLARO / ATIVO
+-- Texto exibido: "SERVER HOP"
+-- Funcao: entrar no servidor selecionado.
+local hopBtn = Instance.new("TextButton")
+hopBtn.Size = UDim2.new(1, -24, 0, 40)
+hopBtn.Position = UDim2.new(0, 12, 0, 96)
+-- Server Hop usa um fundo rosa bem claro quando desativado,
+-- ficando rosa forte somente depois que um servidor for selecionado.
+hopBtn.BackgroundColor3 = Color3.fromRGB(246, 232, 238)
+hopBtn.Font = Enum.Font.GothamBold
+hopBtn.TextSize = 15
+hopBtn.TextColor3 = Color3.fromRGB(50, 40, 46)
+hopBtn.TextStrokeTransparency = 1
+hopBtn.Text = "SERVER HOP"
+hopBtn.AutoButtonColor = false
+hopBtn.ZIndex = 3
+hopBtn.Parent = mainFrame
+
+local hopCorner = Instance.new("UICorner")
+hopCorner.CornerRadius = UDim.new(0, 10)
+hopCorner.Parent = hopBtn
+
+-- CONTORNO DO BUTTON 2: 1px, cinza neutro e discreto (nao e da mesma cor do texto)
+local hopStroke = addStroke(hopBtn, 1, 0.40, Color3.fromRGB(165, 165, 165))
+
+updateHopButtonState = function()
+    if selectedServer then
+        hoverTween(hopBtn, { BackgroundColor3 = Color3.fromRGB(214, 72, 121) }, 0.15):Play()
+        hopBtn.TextColor3 = ON_ACCENT
+        hopStroke.Transparency = 0.2
+    else
+        hoverTween(hopBtn, { BackgroundColor3 = Color3.fromRGB(246, 232, 238) }, 0.15):Play()
+        hopBtn.TextColor3 = Color3.fromRGB(50, 40, 46)
+        hopStroke.Transparency = 0.2
+    end
+end
+
+hopBtn.MouseEnter:Connect(function()
+    if selectedServer then
+        hoverTween(hopBtn, { BackgroundColor3 = Color3.fromRGB(190, 48, 96) }):Play()
+    end
+end)
+hopBtn.MouseLeave:Connect(function()
+    if selectedServer then
+        hoverTween(hopBtn, { BackgroundColor3 = Color3.fromRGB(210, 38, 99) }):Play()
+    end
+end)
+
+hopBtn.MouseButton1Click:Connect(function()
+    if not selectedServer then
+        statusLbl.Text = "Select a server from the list first."
+        return
+    end
+    statusLbl.Text = "Joining via Server Hop..."
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(PLACE_ID, selectedServer.id, LocalPlayer)
+    end)
+    if not ok then
+        statusLbl.Text = "Join error: " .. tostring(err)
+    end
 end)
 
 local hintLbl = Instance.new("TextLabel")
 hintLbl.BackgroundTransparency = 1
 hintLbl.Size = UDim2.new(1, -24, 0, 20)
-hintLbl.Position = UDim2.new(0, 12, 0, 106)
+hintLbl.Position = UDim2.new(0, 12, 0, 164)
 hintLbl.Font = Enum.Font.Gotham
 hintLbl.TextSize = 12
-hintLbl.TextColor3 = TEXT_DIM
+hintLbl.TextColor3 = Color3.fromRGB(105, 105, 110)
 hintLbl.TextXAlignment = Enum.TextXAlignment.Left
-hintLbl.Text = ""
+hintLbl.Text = "Refresh = procurar servidores  •  Server Hop = entrar"
 hintLbl.ZIndex = 3
 hintLbl.Parent = mainFrame
 
-popIn(mainFrame)
+mainFrame.BackgroundTransparency = 0
 
 -- ---------------------------------------------------------------------
 -- Janelinha de resultados (popup)
@@ -446,7 +580,7 @@ popupFrame.Size = UDim2.new(0, 310, 0, 410)
 popupFrame.Position = UDim2.new(0, 330, 0, 120)
 popupFrame.BackgroundColor3 = BG_CARD
 popupFrame.BorderSizePixel = 0
-popupFrame.ClipsDescendants = false
+popupFrame.ClipsDescendants = true
 popupFrame.Visible = false
 popupFrame.Parent = screenGui
 
@@ -454,16 +588,11 @@ local popupCorner = Instance.new("UICorner")
 popupCorner.CornerRadius = UDim.new(0, 10)
 popupCorner.Parent = popupFrame
 
-addGradient(popupFrame, ColorSequence.new({
-    ColorSequenceKeypoint.new(0, BG_GRAD_TOP),
-    ColorSequenceKeypoint.new(1, BG_GRAD_BOT),
-}), 90)
-addStroke(popupFrame, 1, 0.55)
-addShadow(popupFrame)
+addStroke(popupFrame, 1, 0.55, Color3.fromRGB(175, 175, 175))
 
-local popupBar = newTitlebar(popupFrame, "Servidores com menos players", function()
+local popupBar = newTitlebar(popupFrame, nil, function()
     popupFrame.Visible = false
-end, false)
+end)
 makeDraggable(popupBar, popupFrame)
 
 local statusLbl = Instance.new("TextLabel")
@@ -476,7 +605,7 @@ statusLbl.TextColor3 = TEXT_DIM
 statusLbl.TextXAlignment = Enum.TextXAlignment.Left
 statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
 statusLbl.ZIndex = 3
-statusLbl.Text = "Carregando..."
+statusLbl.Text = "Loading..."
 statusLbl.Parent = popupFrame
 
 local colHeader = Instance.new("Frame")
@@ -493,15 +622,15 @@ local function headerLbl(text, xOffset, width)
     l.Position = UDim2.new(0, xOffset, 0, 0)
     l.Font = Enum.Font.GothamBold
     l.TextSize = 11
-    l.TextColor3 = TEXT_DIM
-    l.TextTransparency = 0.2
+    l.TextColor3 = Color3.fromRGB(75, 75, 80)
+    l.TextTransparency = 0
     l.TextXAlignment = Enum.TextXAlignment.Left
     l.Text = text
     l.ZIndex = 3
     l.Parent = colHeader
 end
 headerLbl("#", 6, 26)
-headerLbl("JOGADORES", 34, 90)
+headerLbl("PLAYERS", 34, 90)
 headerLbl("PING", 126, 90)
 
 local listFrame = Instance.new("ScrollingFrame")
@@ -532,18 +661,37 @@ local function clearList()
     end
 end
 
-local function buildResults(servers)
+local function buildResults(servers, lowCount)
     clearList()
+    selectedServer = nil
+    selectedRow = nil
+    rowBaseColors = {}
+    updateHopButtonState()
+
     if not servers or #servers == 0 then
-        statusLbl.Text = "Nenhum servidor encontrado."
+        statusLbl.Text = "No servers found."
         return
     end
-    statusLbl.Text = "Top " .. #servers .. " servidores — clique pra entrar"
+    local lowMsg = ""
+    if lowCount then
+        if lowCount >= MIN_LOW_PING then
+            lowMsg = " (" .. lowCount .. " under " .. LOW_PING_THRESHOLD .. "ms)"
+        elseif lowCount > 0 then
+            lowMsg = " (only " .. lowCount .. " under " .. LOW_PING_THRESHOLD .. "ms available)"
+        else
+            lowMsg = " (none under " .. LOW_PING_THRESHOLD .. "ms right now)"
+        end
+    end
+    statusLbl.Text = "Top " .. #servers .. " servers" .. lowMsg .. " — select one"
 
     for i, s in ipairs(servers) do
         local baseColor = (i % 2 == 0) and BG_ROW_ALT or BG_ROW
 
-        local row = Instance.new("TextButton")
+        -- BUTTON: SERVIDOR
+-- Texto do TextButton: "" (vazio)
+-- O conteudo visual da linha mostra jogadores + ping.
+-- Funcao: selecionar este servidor.
+local row = Instance.new("TextButton")
         row.Size = UDim2.new(1, 0, 0, 34)
         row.BackgroundColor3 = baseColor
         row.AutoButtonColor = false
@@ -551,23 +699,31 @@ local function buildResults(servers)
         row.LayoutOrder = i
         row.ZIndex = 3
         row.Parent = listFrame
+        rowBaseColors[row] = baseColor
 
         local rowCorner = Instance.new("UICorner")
         rowCorner.CornerRadius = UDim.new(0, 6)
         rowCorner.Parent = row
 
+        -- CONTORNO DA LINHA: 1px, cinza neutro bem suave.
+        local rowStroke = addStroke(row, 1, 0.60, Color3.fromRGB(180, 180, 180))
+        rowStroke.Name = "RowStroke"
+
         local rankBadge = Instance.new("Frame")
+        rankBadge.Name = "RankBadge"
         rankBadge.Size = UDim2.new(0, 22, 0, 22)
         rankBadge.Position = UDim2.new(0, 6, 0.5, -11)
-        rankBadge.BackgroundColor3 = BG_TITLEBAR
+        rankBadge.BackgroundColor3 = Color3.fromRGB(250, 216, 228)
         rankBadge.BorderSizePixel = 0
         rankBadge.ZIndex = 4
         rankBadge.Parent = row
         local rankCorner = Instance.new("UICorner")
         rankCorner.CornerRadius = UDim.new(1, 0)
         rankCorner.Parent = rankBadge
+        addStroke(rankBadge, 1, 0.65, Color3.fromRGB(185, 185, 185))
 
         local rankLbl = Instance.new("TextLabel")
+        rankLbl.Name = "RankLbl"
         rankLbl.BackgroundTransparency = 1
         rankLbl.Size = UDim2.new(1, 0, 1, 0)
         rankLbl.Font = Enum.Font.GothamBold
@@ -613,35 +769,67 @@ local function buildResults(servers)
         pingLbl.Parent = row
 
         local joinHint = Instance.new("TextLabel")
+        joinHint.Name = "JoinHint"
         joinHint.BackgroundTransparency = 1
-        joinHint.Size = UDim2.new(0, 60, 1, 0)
-        joinHint.Position = UDim2.new(1, -58, 0, 0)
+        joinHint.Size = UDim2.new(0, 70, 1, 0)
+        joinHint.Position = UDim2.new(1, -68, 0, 0)
         joinHint.Font = Enum.Font.GothamBold
         joinHint.TextSize = 11
         joinHint.TextColor3 = ACCENT
         joinHint.TextTransparency = 1
         joinHint.TextXAlignment = Enum.TextXAlignment.Right
-        joinHint.Text = "ENTRAR"
+        joinHint.Text = "SELECT"
         joinHint.ZIndex = 4
         joinHint.Parent = row
 
         row.MouseEnter:Connect(function()
-            hoverTween(row, { BackgroundColor3 = BG_ROW_HOVER }):Play()
-            hoverTween(joinHint, { TextTransparency = 0 }):Play()
+            if selectedRow ~= row then
+                hoverTween(row, { BackgroundColor3 = BG_ROW_HOVER }):Play()
+                hoverTween(joinHint, { TextTransparency = 0 }):Play()
+            end
         end)
         row.MouseLeave:Connect(function()
-            hoverTween(row, { BackgroundColor3 = baseColor }):Play()
-            hoverTween(joinHint, { TextTransparency = 1 }):Play()
+            if selectedRow ~= row then
+                hoverTween(row, { BackgroundColor3 = baseColor }):Play()
+                hoverTween(joinHint, { TextTransparency = 1 }):Play()
+            end
         end)
 
         row.MouseButton1Click:Connect(function()
-            statusLbl.Text = "Entrando no servidor " .. i .. "..."
-            local ok, err = pcall(function()
-                TeleportService:TeleportToPlaceInstance(PLACE_ID, s.id, LocalPlayer)
-            end)
-            if not ok then
-                statusLbl.Text = "Erro ao entrar: " .. tostring(err)
+            -- desmarca a selecao anterior (volta tudo ao normal)
+            if selectedRow and selectedRow.Parent then
+                local prevBase = rowBaseColors[selectedRow]
+                hoverTween(selectedRow, { BackgroundColor3 = prevBase }, 0.12):Play()
+                local prevBadge = selectedRow:FindFirstChild("RankBadge")
+                if prevBadge then
+                    hoverTween(prevBadge, { BackgroundColor3 = Color3.fromRGB(250, 216, 228) }, 0.12):Play()
+                    local prevRankLbl = prevBadge:FindFirstChild("RankLbl")
+                    if prevRankLbl then prevRankLbl.TextColor3 = ACCENT end
+                end
+                local prevHint = selectedRow:FindFirstChild("JoinHint")
+                if prevHint then
+                    prevHint.Text = "SELECT"
+                    prevHint.TextColor3 = ACCENT
+                    hoverTween(prevHint, { TextTransparency = 1 }, 0.12):Play()
+                end
+                local prevStroke = selectedRow:FindFirstChild("SelectStroke")
+                if prevStroke then prevStroke:Destroy() end
             end
+
+            -- marca a nova selecao: preenchimento + badge + selo bem visiveis
+            selectedServer = s
+            selectedRow = row
+            hoverTween(row, { BackgroundColor3 = Color3.fromRGB(232, 110, 148) }, 0.12):Play()
+            hoverTween(rankBadge, { BackgroundColor3 = Color3.fromRGB(255, 238, 245) }, 0.12):Play()
+            rankLbl.TextColor3 = TITLE_DEEP
+            joinHint.Text = "SELECTED"
+            joinHint.TextColor3 = ON_ACCENT
+            joinHint.TextTransparency = 0
+            local sel = addStroke(row, 1, 0.18, Color3.fromRGB(110, 110, 110))
+            sel.Name = "SelectStroke"
+
+            statusLbl.Text = "Selected server " .. i .. " — click Server Hop to join"
+            updateHopButtonState()
         end)
     end
 end
@@ -658,21 +846,25 @@ local function doRefresh()
         popIn(popupFrame)
     end
 
-    statusLbl.Text = "Buscando servidores..."
+    statusLbl.Text = "Searching servers..."
     clearList()
-    hintLbl.Text = "Procurando os servidores com menos jogadores..."
+    hintLbl.Text = "Looking for the least crowded servers..."
     refreshBtn.Text = "Refreshing..."
 
     task.spawn(function()
-        local servers, err = getTopLowPopServers()
+        local ok, servers, lowCount = pcall(getTopLowPopServers)
         isFetching = false
         hintLbl.Text = ""
-        refreshBtn.Text = "Refresh"
-        if not servers then
-            statusLbl.Text = "Erro: " .. tostring(err)
+        refreshBtn.Text = "REFRESH"
+        if not ok then
+            statusLbl.Text = "Unexpected error: " .. tostring(servers)
             return
         end
-        buildResults(servers)
+        if not servers then
+            statusLbl.Text = "Error: " .. tostring(lowCount)
+            return
+        end
+        buildResults(servers, lowCount)
     end)
 end
 
